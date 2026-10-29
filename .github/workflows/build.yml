@@ -1,3 +1,4 @@
+
 name: Build APK
 
 on:
@@ -28,11 +29,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          - name: Set up Android SDK
+
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
-
+          packages: 'platform-tools platforms;android-37 build-tools;36.0.0'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -48,7 +49,10 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+          if [ -n "$KEYSTORE_BASE64" ] && \
+             [ -n "$KEYSTORE_PASSWORD" ] && \
+             [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEY_PASSWORD" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/droplink-release.jks"
             {
               echo "DROPLINK_KEYSTORE_PATH=$RUNNER_TEMP/droplink-release.jks"
@@ -74,15 +78,30 @@ jobs:
         run: ./gradlew --stacktrace assembleDebug
 
       - name: Collect APK
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
         run: |
           mkdir -p dist
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then label="${GITHUB_REF_NAME}"; else label="${GITHUB_SHA::7}"; fi
-          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-            cp app/build/outputs/apk/release/app-release.apk "dist/DropLink-${label}.apk"
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="$GITHUB_REF_NAME"
           else
-            cp app/build/outputs/apk/debug/app-debug.apk "dist/DropLink-${label}-debug.apk"
+            label="${GITHUB_SHA::7}"
           fi
-          (cd dist && sha256sum *.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+          if [ "$SIGNED" = "true" ]; then
+            cp app/build/outputs/apk/release/app-release.apk \
+              "dist/DropLink-${label}.apk"
+          else
+            cp app/build/outputs/apk/debug/app-debug.apk \
+              "dist/DropLink-${label}-debug.apk"
+          fi
+
+          (
+            cd dist
+            sha256sum *.apk > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
