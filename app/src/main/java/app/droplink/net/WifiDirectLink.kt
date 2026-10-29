@@ -1,0 +1,246 @@
+package app.droplink.net
+
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pInfo
+import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
+import android.os.Looper
+import androidx.core.content.ContextCompat
+import app.droplink.core.protocol.ModeSelector
+import app.droplink.core.protocol.Protocol
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
+
+data class P2pPeer(
+    val address: String,
+    val deviceName: String,
+    /** From the DropLink DNS-SD record, when the OEM stack delivered it. */
+    val dropLinkName: String?,
+    val deviceId: String?,
+    val port: Int?,
+    val isGroupOwner: Boolean,
+) {
+    val displayName: String get() = dropLinkName ?: deviceName
+    val isDropLink: Boolean get() = deviceId != null
+}
+
+/**
+ * Wi-Fi Direct mode. The receiver creates the group (so it is always the group owner) and
+ * advertises a DNS-SD record; the sender discovers it and joins with groupOwnerIntent = 0.
+ * OEM stacks are flaky, so every step has a timeout and the caller falls back to QR mode.
+ */
+@SuppressLint("MissingPermission") // callers check NEARBY_WIFI_DEVICES / location first (see Perms)
+class WifiDirectLink(context: Context) {
+    private val appContext = context.applicationContext
+    private val manager: WifiP2pManager? = appContext.getSystemService(WifiP2pManager::class.java)
+    private var channel: WifiP2pManager.Channel? = null
+
+    val isSupported: Boolean
+        get() = manager != null && appContext.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)
+
+    private fun mgr(): WifiP2pManager = manager ?: throw LinkException(LinkProblem.WIFI_DIRECT_UNSUPPORTED)
+
+    @Synchronized
+    private fun ch(): WifiP2pManager.Channel = channel ?: mgr().initialize(appContext, Looper.getMainLooper()) {
+        synchronized(this) { channel = null } // framework dropped the channel; re-init next time
+    }?.also { channel = it } ?: throw LinkException(LinkProblem.WIFI_DIRECT_UNSUPPORTED)
+
+    /** Runs a WifiP2pManager action; returns null on success or the failure reason code (BUSY on timeout). */
+    private suspend fun action(block: (WifiP2pManager.ActionListener) -> Unit): Int? {
+        val code = withTimeoutOrNull(8_000) {
+            suspendCancellableCoroutine { cont ->
+                runCatching {
+                    block(object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() { if (cont.isActive) cont.resume(SUCCESS) }
+                        override fun onFailure(reason: Int) { if (cont.isActive) cont.resume(reason) }
+                    })
+                }.onFailure { if (cont.isActive) cont.resume(WifiP2pManager.ERROR) }
+            }
+        } ?: WifiP2pManager.BUSY
+        return if (code == SUCCESS) null else code
+    }
+
+    private fun problemFor(reason: Int) = when (reason) {
+        WifiP2pManager.P2P_UNSUPPORTED -> LinkProblem.WIFI_DIRECT_UNSUPPORTED
+        WifiP2pManager.BUSY -> LinkProblem.WIFI_DIRECT_BUSY
+        else -> LinkProblem.WIFI_DIRECT_FAILED
+    }
+
+    // ---------------------------------------------------------------------------------- receiver
+
+    suspend fun startGroup(name: String, deviceId: String, port: Int) {
+        val m = mgr()
+        val c = ch()
+        action { m.removeGroup(c, it) } // ignore: there may be no group
+        val created = action { m.createGroup(c, it) }
+        if (created != null) throw LinkException(problemFor(created), "createGroup failed: $created")
+        action { m.clearLocalServices(c, it) }
+        val record = WifiP2pDnsSdServiceInfo.newInstance(
+            "DropLink",
+            Protocol.NSD_SERVICE_TYPE,
+            mapOf("id" to deviceId, "n" to name.take(30), "port" to port.toString(), "v" to Protocol.VERSION.toString()),
+        )
+        action { m.addLocalService(c, record, it) }
+        action { m.discoverPeers(c, it) } // keeps this phone visible to scanners on many ROMs
+    }
+
+    suspend fun stopGroup() {
+        val m = manager ?: return
+        val c = channel ?: return
+        action { m.clearLocalServices(c, it) }
+        action { m.stopPeerDiscovery(c, it) }
+        action { m.removeGroup(c, it) }
+    }
+
+    // ------------------------------------------------------------------------------------ sender
+
+    fun discover(selfDeviceId: String): Flow<List<P2pPeer>> = callbackFlow {
+        val m = manager
+        if (m == null || !isSupported) {
+            trySend(emptyList())
+            awaitClose {}
+            return@callbackFlow
+        }
+        val c = ch()
+        val devices = HashMap<String, WifiP2pDevice>()
+        val records = HashMap<String, Map<String, String>>()
+
+        fun publish() {
+            val list = devices.values.map { d ->
+                val txt = records[d.deviceAddress]
+                P2pPeer(
+                    address = d.deviceAddress,
+                    deviceName = d.deviceName?.takeIf { it.isNotBlank() } ?: d.deviceAddress,
+                    dropLinkName = txt?.get("n"),
+                    deviceId = txt?.get("id"),
+                    port = txt?.get("port")?.toIntOrNull(),
+                    isGroupOwner = d.isGroupOwner,
+                )
+            }.filter { it.deviceId != selfDeviceId && (it.isDropLink || it.isGroupOwner) }
+            trySend(list)
+        }
+
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action == WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION) {
+                    runCatching {
+                        m.requestPeers(c) { list ->
+                            val seen = list?.deviceList?.associateBy { it.deviceAddress } ?: emptyMap()
+                            devices.keys.retainAll(seen.keys)
+                            devices.putAll(seen)
+                            publish()
+                        }
+                    }
+                }
+            }
+        }
+        ContextCompat.registerReceiver(
+            appContext, receiver, IntentFilter(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION), ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+
+        m.setDnsSdResponseListeners(
+            c,
+            { _, _, _ -> },
+            { _, txt, device ->
+                if (txt != null && txt.containsKey("id")) {
+                    records[device.deviceAddress] = txt
+                    devices[device.deviceAddress] = device
+                    publish()
+                }
+            },
+        )
+        val request = WifiP2pDnsSdServiceRequest.newInstance()
+        action { m.addServiceRequest(c, request, it) }
+
+        trySend(emptyList())
+        // Discovery silently stops after ~2 minutes on most stacks: keep re-arming it.
+        launch {
+            while (isActive) {
+                action { m.discoverPeers(c, it) }
+                action { m.discoverServices(c, it) }
+                delay(12_000)
+            }
+        }
+
+        awaitClose {
+            runCatching { appContext.unregisterReceiver(receiver) }
+            runCatching { m.removeServiceRequest(c, request, null) }
+            runCatching { m.stopPeerDiscovery(c, null) }
+        }
+    }
+
+    /**
+     * Joins the receiver's group and returns the group owner's IP. Tries [ModeSelector.WIFI_DIRECT_ATTEMPTS]
+     * times, each bounded by [ModeSelector.WIFI_DIRECT_TIMEOUT_MS].
+     */
+    suspend fun connect(address: String): String {
+        val m = mgr()
+        val c = ch()
+        var lastProblem = LinkProblem.WIFI_DIRECT_TIMEOUT
+        repeat(ModeSelector.WIFI_DIRECT_ATTEMPTS) { attempt ->
+            try {
+                val ip = withTimeoutOrNull(ModeSelector.WIFI_DIRECT_TIMEOUT_MS) { connectOnce(m, c, address) }
+                if (ip != null) return ip
+                lastProblem = LinkProblem.WIFI_DIRECT_TIMEOUT
+            } catch (e: LinkException) {
+                if (e.problem == LinkProblem.WIFI_DIRECT_UNSUPPORTED) throw e
+                lastProblem = e.problem
+            }
+            action { m.cancelConnect(c, it) }
+            if (attempt + 1 < ModeSelector.WIFI_DIRECT_ATTEMPTS) delay(1_500)
+        }
+        throw LinkException(lastProblem)
+    }
+
+    private suspend fun connectOnce(m: WifiP2pManager, c: WifiP2pManager.Channel, address: String): String {
+        // Already connected to this group (e.g. reconnect after a dropped socket)?
+        groupOwnerIp(connectionInfo(m, c))?.let { return it }
+        val config = WifiP2pConfig().apply {
+            deviceAddress = address
+            groupOwnerIntent = 0 // the receiver must stay group owner
+        }
+        val failed = action { m.connect(c, config, it) }
+        if (failed != null) throw LinkException(problemFor(failed), "connect failed: $failed")
+        while (true) {
+            delay(700)
+            groupOwnerIp(connectionInfo(m, c))?.let { return it }
+        }
+    }
+
+    private fun groupOwnerIp(info: WifiP2pInfo?): String? =
+        if (info != null && info.groupFormed && !info.isGroupOwner) info.groupOwnerAddress?.hostAddress else null
+
+    private suspend fun connectionInfo(m: WifiP2pManager, c: WifiP2pManager.Channel): WifiP2pInfo? =
+        withTimeoutOrNull(3_000) {
+            suspendCancellableCoroutine { cont ->
+                runCatching { m.requestConnectionInfo(c) { info -> if (cont.isActive) cont.resume(info) } }
+                    .onFailure { if (cont.isActive) cont.resume(null) }
+            }
+        }
+
+    /** Leaves the group after a transfer (sender side). */
+    suspend fun disconnect() {
+        val m = manager ?: return
+        val c = channel ?: return
+        action { m.removeGroup(c, it) }
+    }
+
+    private companion object {
+        const val SUCCESS = -1
+    }
+}
